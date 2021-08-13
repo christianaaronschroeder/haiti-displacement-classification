@@ -74,6 +74,7 @@ Several packages were used for this analysis, but the most important was the Car
 library(tidyverse)
 library(htmlTable)
 library(ggplot2)
+library(ggmap)
 library(GGally)
 library(ROCR)
 library(knitr)
@@ -1004,6 +1005,29 @@ The bottom right cell of the correlation plots makes it clear that band 3 repres
 hold.out <- hold.out %>% dplyr::rename(Red = B1, Green = B2, Blue = B3)
 ```
 
+I was also curious of the locations of the blue tarp pixels.
+
+```{r}
+mapboxToken <- paste(readLines("./.mapbox_token"), collapse="")
+Sys.setenv("MAPBOX_TOKEN" = mapboxToken)
+
+fig <- allTarps %>% plot_mapbox(lat = ~Lat, lon = ~Lon, mode = 'scattermapbox')
+
+fig <- fig %>% config(mapboxAccessToken = Sys.getenv("MAPBOX_TOKEN")) %>%
+  layout(
+    mapbox = list(
+      zoom = 13.5,
+      center = list(lon=-72.406, lat=18.5208),
+      style = 'open-street-map'
+      ),
+    width=600, height=400
+    )
+
+fig
+```
+
+A large group of blue tarp pixels were spread around the Fraide River and between two medical centers in Carrefour. The distance to water and a medical center may have played a role in where these displaced people setup camp. Or perhaps they setup camp close to where there homes were. Carrefour was one of the main areas devasted by the earthquake, with approximately 40-50% of the buildings damaged or destroyed (https://escweb.wr.usgs.gov/share/mooney/142.pdf), and it would make sense that people wouldn't have the energy to travel that far after the event.
+
 ```{r, echo=FALSE}
 # reload the needed models and stats
 data.log <- readRDS("./rds_objects/model_log.rds")
@@ -1125,8 +1149,10 @@ I think this method can be effective for classifying blue tarp pixels in imagery
 
 I think these models can greatly benefit relief efforts and influence logistic decisions by identifying highly probable locations of displaced people, but I also recognize there is a lot more work to be done before those people can be helped.
 
+In a country like Haiti where about 60% of the population has cell phones (https://www.statista.com/statistics/502111/mobile-cellular-subscriptions-per-100-inhabitants-in-haiti/), pinging the locations of those devices might be a faster and more accurate approach to locating displaced people.
+
 ### Model Improvement
 
 On a larger scale of imagery, I believe the accuracy of the models could be improved with some geospatial influence. Predicting the location of people strictly off color leaves a lot of room to be misled. For example, a shed on a farm has a blue roof, or there is a water feature reflecting enough light.
 
-If the nature of the placement of blue tarps followed a general rule, where most displaced people congregated together, then additional tools like kernel density could be used to add extra confidence to the predictions. Adding this spatial context would allow the model to rule out the "blue tarp" pixels that were located in very sparsely populated areas that are very unlikely to be hosting displaced individuals. The results of which could be provided in the form of heatmaps instead of direct point locations, which would be more beneficial to search parties by not having a strict location rather a general area in which displaced people are possibly moving locations.
+If the nature of the placement of blue tarps followed a general rule, where most displaced people congregated together, then additional tools like kernel density could be used to add extra confidence to the predictions. Adding this spatial context would allow the model to rule out the "blue tarp" pixels that were located in very sparsely populated areas that are very unlikely to be hosting displaced individuals. The results of which could be provided in the form of heatmaps instead of direct point locations, which would be more beneficial to search parties by not having a strict location rather a general area in which displaced people are possibly moving locations. It is also likely that the displaced people did not travel very far from their original locations, so other factors like population density or buildings damaged in the area could also influence the predictions. 
