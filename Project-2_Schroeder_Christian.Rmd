@@ -59,13 +59,15 @@ In the wake of the earthquake, an estimated five million people, more than 50% o
 
 In an effort to assist the search, a team from the Rochester Institute of Technology (RIT) collected aerial imagery of the country. These images were then converted into datasets of Red, Green, and Blue (RGB) values. Using this RGB data from the imagery, with the knowledge that many of the displaced people were using distinguishable blue tarps as their shelter, I attempted to predict the locations of these blue tarps using several classification models.
 
-My goal in this analysis was to determine the optimal model for locating displaced people. To determine those models, I focused on two statistics; accuracy, and false negative rate (FNR). Given the context of the situation, I believed the FNR to be a very important metric, much more than the false positive rate (FPR), because I wanted to make sure no displaced individual was being overlooked. I would much rather have over-classified and found no one at a certain location than under-classify and not provide aid to someone in need. But, it is important to note that these efforts still needed to be made in a timely manner, so grossly over-classifying to get the smallest FNR was not the optimal solution. So, a combination of accuracy, FNR, and FPR was used to determine these models.
+My goal in this analysis was to determine the optimal model for locating displaced people. To determine those models, I focused on three statistics; accuracy, false positive rate (FPR), and false negative rate (FNR). Given the context of the situation, I believed the FNR to be a very important metric, much more than the false positive rate (FPR), because I wanted to make sure no displaced individual was being overlooked. I would much rather have over-classified and found no one at a certain location than under-classify and not provide aid to someone in need. But, it is important to note that these efforts still needed to be made in a timely manner, so grossly over-classifying to get the smallest FNR was not the optimal solution. So, a combination of accuracy, FNR, and FPR was used to determine these models.
+
+Two datasets were provided for this analysis, the training data and the hold-out data. All seven models were trained using 10-fold cross validation and then their predictive ability tested on the hold-out dataset.
 
 # Training Data / EDA
 
 ### Packages
 
-Several packages were used for this analysis, but the most important was the Caret package. This package allowed me to easily reproduce different trained models, use the same 10-fold cross-validation on each, and iteratively test different threshold, alpha, and lambda values when needed.
+Several packages were used for this analysis, but the most important was the Caret package. This package allowed me to easily reproduce different trained models, use the same 10-fold cross-validation on each, and iteratively test different thresholds and tuning parameters when needed.
 
 ```{r load-packages, warning=FALSE, message=FALSE}
 # Load Required Packages
@@ -78,6 +80,13 @@ library(knitr)
 library(caret)
 library(plotly)
 library(gridExtra)
+library(doParallel)
+```
+
+Parallel processing was used for the training of each model to improve performance.
+
+```{r}
+numCores <- 14
 ```
 
 ### The Pixel Data
@@ -85,7 +94,7 @@ library(gridExtra)
 The data provided for this analysis consists of four fields. "Class" defines land-classification of the pixel, whether that be vegetation, soil, rooftop, various non-tarp, or blue tarp. The other three classes, "Red," "Green," and "Blue," pertain to the RGB color values of the pixel. The RGB values are what were used as the predictors in the models.
 
 ```{r}
-data <- read.table("HaitiPixels.csv", sep=",", header=TRUE)
+data <- read.table("./data/HaitiPixels.csv", sep=",", header=TRUE)
 ```
 
 To make the analysis easier, a new binary field was added to the dataset representing whether or not the pixel was a "Blue Tarp." This was done to simplify the modeling process, because we are not interested in predicting the other classes. The new field, "ClassTarp," was used as the response in the models.
@@ -99,16 +108,16 @@ data$ClassTarp <- factor(data$ClassTarp, levels = c("No", "Yes"))
 
 In exploring the correlations of the color values, I noticed it was less likely to see any Blue Tarp pixels with Red values above 200. Also, only pixels with a Blue value above \~100 were classified as Blue Tarp. This may cause issues in areas that had strong shadows from trees or buildings.
 
-```{r, echo=FALSE}
+```{r}
 data %>%
   dplyr::select(-Class, -ClassTarp) %>%
   ggpairs(upper=list(continuous=wrap("cor", size=3)),
-          mapping=ggplot2::aes(color=data$ClassTarp))
+          mapping=ggplot2::aes(color=data$ClassTarp,alpha=0.7))
 ```
 
 Because the pixel values are comprised of three colors, I thought a 3D scatter plot would be more appropriate for showing how all the values played into each classification. In the plot below, it is easy to see a strong distinction between the Blue Tarp pixels and the others. There is very little bleed into the other category's areas. Also, I noticed the volume of Blue Tarp pixels grows in size as all values increase. This could be because at lower color values, the pixels get very dark, making it more difficult to classify a pixel as Blue Tarp.
 
-```{r, echo=FALSE}
+```{r}
 plot_ly(x=data$Red, y=data$Green, z=data$Blue, type="scatter3d", mode="markers", color=data$Class)
 ```
 
@@ -120,7 +129,7 @@ After looking at the relationships between the three color values, and how they 
 
 ## Set-up
 
-#### Variables
+### Variables
 
 Several values were set and functions created to make the model building and analysis process more efficient. This included setting a universal seed to make sure everything is reproducible. Folds were created from the data and a trainControl() object so the same 10-fold cross validation was performed on all models.
 
@@ -141,7 +150,7 @@ control <- trainControl(method="cv",
                         allowParallel=TRUE)
 ```
 
-#### Functions
+### Functions
 
 The threshold_test() function was created to produce a dataframe of summary statistics from the inputted model using multiple thresholds, in order to determine the most desirable value. The function makes use of the thresholder() function from the Caret package, which takes in a model, a sequence of threshold values, and a list of summary statistics, and returned a dataframe of those statistics calculated for each threshold value. Because I was also interested minimizing the false negative rate, I added that to the dataframe before it was returned.
 
@@ -182,21 +191,72 @@ plotROC <- function(model, stats.selected, model_name) {
 }
 ```
 
-#### Formulas
+The predictionStats() function was made to calculate and organize the predictive ability of the trained models on the hold-out dataset. The use of parallel processing was applied within the function because the closing of the cluster after each model consistently kept memory usage low.
 
-For each model type I started by comparing the measured accuracy, kappa, and other summary statistics of two formulas. The first formula being the basic full formula,
+```{r}
+predictionStats <- function(model, oldStats) {
+  
+  cluster <- makePSOCKcluster(numCores) 
+  registerDoParallel(cluster)
+  
+  set.seed(useed)
+  prob <- predict(model, newdata=hold.out, type="prob")
+  pred <- as.factor(ifelse(prob$Yes>oldStats$prob_threshold, "Yes", "No"))
+  rate <- prediction(prob[,2], hold.out$ClassTarp)
+  auc <- performance(rate,"auc")
+  
+  stopCluster(cluster)
+  
+  conf <- confusionMatrix(pred, hold.out$ClassTarp)
+  
+  Tuning <- NaN
+  Tuning2 <- NaN
+  
+  cols <- colnames(oldStats)
+  
+  # tuning
+  for (col in c("alpha","k","mtry","C")) {
+    if(col %in% cols){
+      Tuning <- oldStats[[col]]
+    }
+  }
+  
+  # tuning2
+  for (col in c("lambda","sigma")) {
+    if(col %in% cols){
+      Tuning2 <- oldStats[[col]]
+    }
+  }
+  
+  stats <- data.frame(Tuning = Tuning,
+                      Tuning2 = Tuning2,
+                      AUROC = auc@y.values[[1]],
+                      Threshold = oldStats$prob_threshold,
+                      Accuracy = conf$overall[["Accuracy"]],
+                      TPR = conf$byClass[["Sensitivity"]],
+                      FPR = 1-conf$byClass[["Specificity"]],
+                      Precision = conf$byClass[["Precision"]])
+  return(stats)
+}
+```
+
+
+### Formulas
+
+For most model types I started by comparing the measured accuracy, kappa, and other summary statistics of two formulas. The first formula being the basic full formula,
 
 $$
-ClassTarp = Redx_1 + Greenx_2 + Bluex_3
+\text{ClassTarp} = \text{Red}x_1 + \text{Green}x_2 + \text{Blue}x_3
 $$
 
 and the second being that same formula with an added interaction,
 
 $$
-ClassTarp = Redx_1 + Greenx_2 + Bluex_3 + x_4(Green:Blue)
+\text{ClassTarp} = \text{Red}x_1 + \text{Green}x_2 + \text{Blue}x_3 + \text{(Green:Blue)}x_4
 $$
 
 I did this believing there may be a case where the added interaction proved to make the model more accurate, or maybe reduced the FNR a desirable amount.
+
 
 ## Logistic Regression
 
@@ -207,6 +267,9 @@ To create the logistic regression models, I used the train() function of the Car
 ```{r, warning=FALSE, message=FALSE}
 # https://www.youtube.com/watch?v=BQ1VAZ7jNYQ
 set.seed(useed)
+
+cluster <- makePSOCKcluster(numCores) 
+registerDoParallel(cluster)
 
 data.log <- train(ClassTarp~Red+Green+Blue,
                   data=data,
@@ -219,8 +282,10 @@ data.log.i <- train(ClassTarp~Red+Green+Blue+Green:Blue, data=data,
                   method="glm",
                   trControl=control)
 
-rbind(c("R+G+B",data.log$results[2],data.log$results[3]),
-      c("R+G+B+G:B",data.log.i$results[2],data.log.i$results[3]))
+stopCluster(cluster)
+
+data.log$results %>% slice_max(Accuracy)
+data.log.i$results %>% slice_max(Accuracy)
 ```
 
 Comparing the accuracy and kappa statistics of each model, I saw that the values were identical, implying that adding the interaction would not be beneficial enough to justify the added complexity. However, there was still a chance that the added interaction could benefit other statistics, so I ran the threshold test on both models to compare their performances across multiple threshold values.
@@ -259,6 +324,9 @@ To create the LDA models, I used the train() function again, but set the method 
 ```{r}
 set.seed(useed)
 
+cluster <- makePSOCKcluster(numCores) 
+registerDoParallel(cluster)
+
 data.lda <- train(ClassTarp~Red+Green+Blue, data=data,
                   method="lda",
                   trControl=control)
@@ -267,8 +335,11 @@ data.lda.i <- train(ClassTarp~Red+Green+Blue+Green:Blue, data=data,
                     method="lda",
                     trControl=control)
 
-rbind(c("R+G+B",data.lda$results[2],data.lda$results[3]),
-      c("R+G+B+G:B",data.lda.i$results[2],data.lda.i$results[3]))
+stopCluster(cluster)
+
+data.lda$results %>% slice_max(Accuracy)
+data.lda.i$results %>% slice_max(Accuracy)
+
 ```
 
 Unlike what I saw with the logistic regression models, there was a difference in the interaction and no-interaction models for LDA. The kappa value for the no-interaction model was relatively lower. It seemed the best model to use was the interaction model because of the better metrics, but I wanted to be sure, so I ran the threshold test on both models.
@@ -305,6 +376,9 @@ To create the QDA models, I used the train() function again, but set the method 
 ```{r}
 set.seed(useed)
 
+cluster <- makePSOCKcluster(numCores) 
+registerDoParallel(cluster)
+
 data.qda <- train(ClassTarp~Red+Green+Blue, data=data,
                   method="qda",
                   trControl=control)
@@ -313,8 +387,10 @@ data.qda.i <- train(ClassTarp~Red+Green+Blue+Green:Blue, data=data,
                     method="qda",
                     trControl=control)
 
-rbind(c("R+G+B",data.qda$results[2],data.qda$results[3]),
-      c("R+G+B+G:B",data.qda.i$results[2],data.qda.i$results[3]))
+stopCluster(cluster)
+
+data.qda$results %>% slice_max(Accuracy)
+data.qda.i$results %>% slice_max(Accuracy)
 ```
 
 Expectedly, the accuracies of the no-interaction and interaction models were very similar. But unlike the outcomes of the logistic regression and LDA model comparisons, the QDA models showed the no-interaction model being more accurate and with a higher kappa. From this, I was very doubtful that the added interaction could benefit the model at all, but I thought it was worth verifying through the threshold test.
@@ -342,6 +418,18 @@ qda.selected <- plotROC(data.qda.i, qda.selected, "QDA")
 
 The ROC curve for the selected QDA model was pretty good, and had a similar point of TPR where the sharp increase stops. It was similar to the others, but not as jagged in the corner as the LDA ROC curve. The AUROC for this model was 0.997053.
 
+```{r, echo=FALSE}
+# https://stackoverflow.com/questions/1395270/determining-memory-usage-of-objects
+# sort(sapply(ls(),function(x){object.size(get(x))}), decreasing=TRUE)
+
+rm(data.log.i,
+   data.log.i.thres,
+   data.lda,
+   data.lda.thres,
+   data.qda,
+   data.qda.i.thres)
+```
+
 ## KNN
 
 ### Model Training
@@ -351,6 +439,11 @@ To create the KNN models, I used the train() function again, but made several ch
 It was important to consider the additional argument for the train() function, preProcess. Adding "center" and "scale" to that argument would normalize the color values, and is a common practice I saw online when using Caret to train a KNN model. However, because the RGB values represent real-world color that was normalized to a scale of 0-255, I did not believe it was necessary to normalize the data again.
 
 ```{r}
+cluster <- makePSOCKcluster(numCores)
+registerDoParallel(cluster)
+
+start.time <- Sys.time()
+
 set.seed(useed)
 
 klist <- data.frame(k=seq(0,50,5))
@@ -368,31 +461,38 @@ data.knn.i <- train(ClassTarp~Red+Green+Blue+Green:Blue, data=data,
                     metric="Accuracy",
                     trControl=control)
 
+stopCluster(cluster)
+
 data.knn$results %>% slice_max(Accuracy)
 data.knn.i$results %>% slice_max(Accuracy)
+```
+
+```{r}
+plot(data.knn, main="Accuracy of KNN at different k")
 ```
 
 #### Tuning Parameter
 
 For all levels of k, the no-interaction and interaction model had very similar outcomes, so I believed it best to work with the no-interaction model for simplicity.
 
-The output of the train() function shows the optimal k value to be 10, based on accuracy. I was hesitant to use 10, because the accuracy remained above 0.99 for all k values tested. I think 10 could prove to be a problem for a larger dataset, possibly causing errors in variance.
-
-```{r, echo=FALSE}
-plot(data.knn, main="Accuracy of KNN at different k values")
-```
+The output of the train() function shows the optimal k value to be 5, based on accuracy. I was hesitant to use 10, because the accuracy remained above 0.99 for all k values tested. I think 5 could prove to be a problem for a larger dataset, possibly causing errors in variance.
 
 So, I chose to go with k=20 to retain a similar accuracy but with more potential stability. Given the nature of the train() function, I needed to re-run it with 20 as the only available value for k to get the model object.
 
 ```{r}
+cluster <- makePSOCKcluster(numCores)
+registerDoParallel(cluster)
+
 data.knn20 <- train(ClassTarp~Red+Green+Blue, data=data,
                   tuneGrid = data.frame(k=seq(20,20,1)),
                   method="knn",
                   metric="Accuracy",
                   trControl=control)
+
+stopCluster(cluster)
 ```
 
-```{r, echo=FALSE}
+```{r}
 data.knn.thres <- threshold_test(data.knn)
 data.knn20.thres <- threshold_test(data.knn20) # had to run up here to get the plot to work
 
@@ -462,12 +562,14 @@ The ROC curve for the selected KNN model looks very good. The curve is better th
 
 ## Penalized Logistic Regression (ElasticNet)
 
-### Model Building
+### Model Training
 
 Going off of advice from Professor Gedeck, I decided to start with a ridge regression model and work forward from there. To create the ridge model, and other elasticNet models after that, I used the train() function again, with the method set to "glmnet." A tune grid was also added to the train() function containing a sequence of lambda values from 0 to 1 every 0.1.
 
 ```{r}
 set.seed(useed)
+cluster <- makePSOCKcluster(numCores)
+registerDoParallel(cluster)
 
 lambdaGrid <- expand.grid(alpha = 0, lambda = seq(0,1, 0.1))
 
@@ -481,11 +583,13 @@ data.ridge.i <- train(ClassTarp~Red+Green+Blue+Green:Blue, data=data,
                   tuneGrid=lambdaGrid,
                   trControl=control)
 
+stopCluster(cluster)
+
 data.ridge$results %>% slice_max(Accuracy)
 data.ridge.i$results %>% slice_max(Accuracy)
 ```
 
-```{r, echo=FALSE}
+```{r}
 plot(data.ridge, main="Accuracy of PLR at different Lambda values")
 ```
 
@@ -498,17 +602,22 @@ A second model was created, this time with a constant lambda of 0, and a sequenc
 ```{r}
 set.seed(useed)
 
+cluster <- makePSOCKcluster(numCores)
+registerDoParallel(cluster)
+
 alphaGrid <- expand.grid(alpha = seq(0,1, 0.05), lambda=0)
 
 data.elastic <- train(ClassTarp~Red+Green+Blue, data=data,
                       method="glmnet",
                       tuneGrid=alphaGrid,
-                      trControl=control)   
-       
+                      trControl=control)
+
+stopCluster(cluster)
+
 data.elastic$results %>% slice_max(Accuracy)
 ```
 
-```{r, echo=FALSE}
+```{r}
 plot(data.elastic, main="Accuracy of PLR at different Alpha values")
 ```
 
@@ -517,11 +626,16 @@ With a lambda of 0, the most accurate model produced had an alpha of 0.8. This v
 ### Determining Threshold
 
 ```{r, echo = FALSE}
+cluster <- makePSOCKcluster(numCores)
+registerDoParallel(cluster)
+
 # re-run with set alpha and lambda to get the right number of predictions
 data.elastic2 <- train(ClassTarp~Red+Green+Blue, data=data,
                       method="glmnet",
                       tuneGrid=expand.grid(alpha=0.8, lambda=0),
                       trControl=control)
+
+stopCluster(cluster)
 ```
 
 ```{r}
@@ -542,84 +656,281 @@ plr.selected <- plotROC(data.elastic2, plr.selected, "Penalized Logistic Regress
 
 The ROC curve for the penalized logistic regression model was good and looked quite similar to the ROC curve of the logistic regression. It also rounds off at the corner, similar to the QDA curve. The AUROC for this model was 0.9985056.
 
+```{r, echo=FALSE}
+# remove unused
+rm(data.knn.i,
+   data.knn,
+   data.knn.thres,
+   data.ridge,
+   data.ridge.i,
+   data.elastic)
+
+# save and remove selected models to be used later
+saveRDS(data.log, "./rds_objects/model_log.rds")
+saveRDS(data.lda.i, "./rds_objects/model_lda.rds")
+saveRDS(data.qda.i, "./rds_objects/model_qda.rds")
+saveRDS(data.knn20, "./rds_objects/model_knn.rds")
+saveRDS(data.elastic2, "./rds_objects/model_plr.rds")
+
+# remove saved models
+rm(data.log,
+   data.lda.i,
+   data.qda.i,
+   data.knn20,
+   data.elastic2)
+```
+
+
 ## Random Forest
 
-### Model Building
+### Model Training
 
-Because there are minimal parameters available, tune mtry, maybe tune ntree
+Because of the processing time required to train a random forest model, I did not train the interaction model to compare to the no-interaction model. With this data, there were only 3 parameters to be used which greatly limited the number of different values we should try for mtry. The general rule of thumb when choosing a value for mtry is to either choose the square root of the number of parameters, or the number of parameters divided by three. With those two values coming out to almost 2, and 1, I decided to only test which of those would be optimal.
 
 ```{r}
 set.seed(useed)
 
-mtryGrid <- data.frame(k=seq(1,5))
+cluster <- makePSOCKcluster(8) # not enough RAM to handle 14 workers for RF
+registerDoParallel(cluster)
+
+mtryGrid <- data.frame(mtry=c(1,2))
 
 data.rdf <- train(ClassTarp~Red+Green+Blue, data=data,
-                  tuneGrid = mtryGrid,
+                  tuneGrid = mtryGrid,   
                   method="rf",
                   metric="Accuracy",
                   trControl=control)
 
-data.rdf.i <- train(ClassTarp~Red+Green+Blue+Green:Blue, data=data,
-                    tuneGrid = mtryGrid,
-                    method="rf",
-                    metric="Accuracy",
-                    trControl=control)
+stopCluster(cluster)
 
 data.rdf$results %>% slice_max(Accuracy)
-data.rdf.i$results %>% slice_max(Accuracy)
 ```
 
-### Tuning Parameter
-
-```{r}
-
-```
+The value for mtry that came out with the highest accuracy was 2.
 
 ### Determining Threshold
 
 ```{r}
+data.rdf.thres <- threshold_test(data.rdf)
+data.rdf.thres[2:9] %>% slice_max(Accuracy)
+```
 
+```{r}
+p1 <- ggplot() +
+  geom_line(data = data.rdf.thres,
+            aes(x = prob_threshold, y = Accuracy), lwd=1) +
+  labs(x = "Threshold", y="Accuracy", title="Random Forest: Accuracy by Threshold")
+
+p2 <- ggplot() +
+  geom_line(data = data.rdf.thres,
+            aes(x = prob_threshold, y = falseNeg), lwd=1) +
+  labs(x = "Threshold", y="FNR", title="Random Forest: FNR by Threshold")
+grid.arrange(p1,p2,nrow=1)
+```
+With mtry=2, the model saw the highest accuracy at a threshold of 0.5. The FNR at that threshold is still very good, <0.002, so I believed this to be the best value to go with.
+
+```{r, echo=FALSE}
+rm(data.rdf)
 ```
 
 ### ROC Curve
 
-```{r}
+The model was re-trained with the optimal mtry value to get the correct number of predictions.
 
+```{r}
+cluster <- makePSOCKcluster(numCores)
+registerDoParallel(cluster)
+
+set.seed(useed)
+
+# re-running to get the right number of predictions
+data.rdf1 <- train(ClassTarp~Red+Green+Blue, data=data,
+                  tuneGrid = data.frame(mtry=2),   
+                  method="rf",
+                  metric="Accuracy",
+                  trControl=control)
+
+stopCluster(cluster)
 ```
+
+I used the plotROC() function to both plot the ROC curve and calculate the AUROC value of the model.
+
+```{r}
+rdf.selected <- data.rdf.thres %>% slice_max(Accuracy)
+rdf.selected <- plotROC(data.rdf1, rdf.selected, "Random Forest")
+```
+
+The ROC curve for the random forest model was very good. There is no rounding at the top left corner, but it was worth noting that the TPR did not reach exactly 1.0 as quickly as the other models. The AUROC for this model was 0.9942777. 
+
+```{r, echo=FALSE}
+saveRDS(data.rdf1, "./rds_objects/model_rdf.rds")
+rm(data.rdf1)
+```
+
 
 ## SVM (Support Vector Machines)
 
-### Model Building
+### Model Training
 
-try the different types of SVM
+For the SVM models, instead of comparing a no interaction to an interaction model, I compared the accuracies of the different kernel basis; linear, radial, and polynomial. Because RGB values are already normalized to a 0-255 scale, I did not see it necessary to pre-process the data in the train() function.
 
-### Tuning Parameter
+Each kernel basis takes in slightly different tuning parameters to train the model. The linear kernel uses cost, a parameter used to determine the level of misclassification that will be allowed. This is done as cost is treated as a weight for penalizing the soft margin.
+
+The polynomial kernel takes in degree as a turning parameter, which determines the degree of the polynomial used for the decision boundary. A degree of 1 yields a linear separation while higher degrees allow more flexibility in the decision boundary.nb mn 
+
+The radial basis kernel takes in cost as a tuning parameter, but also takes in sigma. Sigma defines the reach of a single training instance's influence. Larger sigma values allow more flexibility by allow influence from data further from the decision boundary. The smaller the sigma value, the less points influence the shape of the boundary.
+
+To create the SVM models, I used the train() function but this time did not make changes to the settings. I let each kernel run as default to compare what was produced.
+
+```{r}
+cluster <- makePSOCKcluster(numCores)
+registerDoParallel(cluster)
+
+set.seed(useed)
+
+# https://rpubs.com/uky994/593668
+data.svm.linear <- train(ClassTarp~Red+Green+Blue, data=data,  
+                         method="svmLinear",
+                         metric="Accuracy",
+                         trControl=control)
+
+data.svm.poly <- train(ClassTarp~Red+Green+Blue, data=data,  
+                       method="svmPoly",
+                       metric="Accuracy",
+                       trControl=control)
+
+data.svm.radial <- train(ClassTarp~Red+Green+Blue, data=data,  
+                         method="svmRadial",
+                         metric="Accuracy",
+                         trControl=control)
+
+stopCluster(cluster)
+
+data.svm.linear$results %>% slice_max(Accuracy)
+data.svm.poly$results %>% slice_max(Accuracy)
+data.svm.radial$results %>% slice_max(Accuracy)
+```
+
+With the default tuning settings for SVM in Caret, the outputs showed that using the radial basis function kernel was the most effective. The model chose sigma=8.183301 and C=1 for the tuning parameters. Not only was the radial function more accurate, but it was also more time efficient when compared to the polynomial function.
+
+```{r, echo=FALSE}
+rm(data.svm.linear,
+   data.svm.poly)
+```
+
+Although the radial model was very promising, I was aware that it only tested three values for C; 0.25, 0.5, and 1. The model chose 1 for C and was trained with a constant value for sigma at 8.183301. I wanted to further explore those tuning parameters so I did some sensitivity testing around the given values.
+
+```{r}
+cluster <- makePSOCKcluster(numCores)
+registerDoParallel(cluster)
+
+set.seed(useed)
+
+rad.grid <- expand.grid(C=c(0.75, 1, 1.5, 2), sigma=c(7.5, 8, 8.18, 9, 9.5))
+
+data.svm.radial2 <- train(ClassTarp~Red+Green+Blue, data=data,  
+                         method="svmRadial",
+                         metric="Accuracy",
+                         trControl=control,
+                         tuneGrid=rad.grid)
+
+stopCluster(cluster)
+
+data.svm.radial2$results %>% slice_max(Accuracy)
+```
+
+After manually tuning the radial model, I found that a cost of 2 with sigma of either 9 or 9.5 was the optimal combination for accuracy.
 
 ### Determining Threshold
 
+```{r}
+data.svm.radial.thres <- threshold_test(data.svm.radial)
+data.svm.radial.thres[1:9] %>% slice_max(Accuracy)
+
+data.svm.radial2.thres <- threshold_test(data.svm.radial2)
+data.svm.radial2.thres[1:9] %>% slice_max(Accuracy)
+```
+
+There was little difference between the performances of the auto-tuned and manually tuned models. Although, the manually tuned model performed better in most metrics, including Accuracy and FNR. Both model chose 0.7 as the optimal threshold.
+
+```{r, echo=FALSE}
+# Remove the unused objects to save memory space
+rm(data.svm.radial,
+   data.svm.radial2)
+```
+
 ### ROC Curve
+
+The model was retrained with the optimal tuning parameters to get the correct number of predictions.
+
+```{r}
+cluster <- makePSOCKcluster(numCores)
+registerDoParallel(cluster)
+# re-running to get the right number of predictions
+data.svm.radial3 <- train(ClassTarp~Red+Green+Blue, data=data,  
+                         method="svmRadial",
+                         metric="Accuracy",
+                         trControl=control,
+                         tuneGrid=data.frame(sigma=9, C=2))
+stopCluster(cluster)
+```
+
+I used the plotROC() function to both plot the ROC curve and calculate the AUROC value of the model.
+
+```{r}
+data.svm.radial3.thres <- threshold_test(data.svm.radial3)
+svm.selected <- data.svm.radial3.thres %>% slice_max(Accuracy)
+svm.selected <- plotROC(data.svm.radial3, svm.selected, "Support Vector Machine")
+```
+
+Very similar to the ROC curve of the random forest model, the ROC curve for the SVM model had no rounded corner, and was not quick to reach a TPR of exactly 1.0. The AUROC of this model was 0.9952222.
+
+```{r, echo=FALSE}
+saveRDS(data.svm.radial3, "./rds_objects/model_svm.rds")
+rm(data.svm.radial3)
+```
 
 # Results (Cross-Validation)
 
-```{r, echo=FALSE}
+```{r}
 # add model name to stats
 log.selected <- log.selected %>% mutate(Model="Log Reg")
 lda.selected <- lda.selected %>% mutate(Model="LDA")
 qda.selected <- qda.selected %>% mutate(Model="QDA")
 knn.selected <- knn.selected %>% mutate(Model="KNN")
 plr.selected <- plr.selected %>% mutate(Model="PLR")
+rdf.selected <- rdf.selected %>% mutate(Model="RF")
+svm.selected <- svm.selected %>% mutate(Model="SVM")
+```
 
+
+```{r, echo=FALSE}
+# just in case R crashes
+saveRDS(log.selected, "./rds_objects/stats_log.rds")
+saveRDS(lda.selected, "./rds_objects/stats_lda.rds")
+saveRDS(qda.selected, "./rds_objects/stats_qda.rds")
+saveRDS(knn.selected, "./rds_objects/stats_knn.rds")
+saveRDS(plr.selected, "./rds_objects/stats_plr.rds")
+saveRDS(rdf.selected, "./rds_objects/stats_rdf.rds")
+saveRDS(svm.selected, "./rds_objects/stats_svm.rds")
+```
+
+
+```{r, echo=FALSE}
 # merge the stats together, create tuning column from k and alpha
 stats.selected <- Reduce(function(x, y) merge(x, y, all=TRUE),
                          list(log.selected,
                               lda.selected,
                               qda.selected,
                               knn.selected,
-                              plr.selected)) %>% mutate(Tuning = coalesce(k,alpha))
+                              plr.selected,
+                              rdf.selected,
+                              svm.selected)) %>% mutate(Tuning = coalesce(k,alpha,mtry,C),
+                                                        Tuning2 = coalesce(lambda, sigma))
 
 # format the table and set Model as the index
 stats.table <- stats.selected %>%
-  dplyr::select("Model","Tuning","AUROC",
+  dplyr::select("Model","Tuning", "Tuning2","AUROC",
                 "prob_threshold","Accuracy",
                 "Sensitivity","falsePos","Precision") %>%
   rename(Threshold=prob_threshold, TPR=Sensitivity, FPR=falsePos) %>%
@@ -627,33 +938,195 @@ stats.table <- stats.selected %>%
   round(4)
 
 # reorder to match example given
-stats.table <- stats.table[c(5,3,2,1,4),]
-
+stats.table <- stats.table[c(6,4,3,2,5,1,7),]
 # https://cran.r-project.org/web/packages/htmlTable/vignettes/general.html
 stats.table %>%
   addHtmlTableStyle(col.rgroup = c("none", "#F8F8F8")) %>%
   htmlTable(rowlabel="Model",
-            caption="* lambda for PLR (0) not shown")
+            caption="*Tuning2 refers to lambda for PLR and sigma for SVM.")
 ```
+
+Each of the seven classification methods tested in this analysis proved to be very effective options for classifying blue tarp pixels based on RGB values, when training through 10-fold cross-validation. Two models performed very similarly, the logistic regression and penalized logistic regression model. This makes sense because the optimal lambda value was zero, so the predictors were not minimized to any extent. The only statistics where the two models differed were the TPR and FPR, where the penalized logistic regression model had slightly higher values. Overall, each model type was very effective, but the question was, which one was the optimal solution?
+
+When only looking at the table, the best option appeared to be Random Forest. The RF model had the one of the highest accuracies and the lowest FPR. The metrics for the RF model were very promising, but it needed to be noted that these were all calculated without the use of a test dataset. In order to double-down on RF being the best model or to crown a different method as optimal, the models needed to be tested against the hold-out data.
 
 # Hold-out Data / EDA
 
-Load data, explore data, etc.
+## Importing The Data
+
+The hold-out data provided was not of the same format as the training data. It was given as several text files with not-exactly matching naming conventions. The data in the text files were also not exactly in CSV format. Each file started with 7 lines of output metadata from when the values were exported from ENVI. This did introduce a small problem for importing the data, but I was able to navigate it fairly easily.
+
+```{r}
+#setwd("C:\\Users\\cschr\\Documents\\GitHub\\haiti-displacement-classification")
+setwd("./data")
+files <- list.files(pattern = "*.txt", full.names=TRUE)
+
+hold.out <- data.frame(matrix(ncol=10, nrow=0))
+colnames(hold.out) <- c("X","Y","MapX","MapY","Lat","Lon","B1","B2","B3","ClassTarp")
+
+for (file in files) {
+  lines <- readLines(file)[-c(1:8)]
+  csv <- read.csv(textConnection(lines), header=FALSE, sep="")[-1]
+  names(csv) <- c("X","Y","MapX","MapY","Lat","Lon","B1","B2","B3")
+  csv$ClassTarp <- ifelse(grepl("NON|NOT", file), "No", "Yes")
+  hold.out <- rbind(hold.out, csv)
+}
+
+hold.out$ClassTarp <- factor(hold.out$ClassTarp, levels = c("No", "Yes"))
+
+head(hold.out)
+```
+## EDA
+
+The true problem with the hold-out data was the column names. This data did not include RGB labels but band numbers.
+
+```{r}
+allTarps <- subset(hold.out, ClassTarp=="Yes")
+(c(mean(allTarps$B1),mean(allTarps$B2),mean(allTarps$B3)))
+
+dataTarps <- subset(data, ClassTarp=="Yes")
+(c(mean(dataTarps$Red),mean(dataTarps$Green),mean(dataTarps$Blue)))
+
+noTarps <- subset(hold.out, ClassTarp=="No")
+(c(mean(noTarps$B1),mean(noTarps$B2),mean(noTarps$B3)))
+
+all <- rbind(allTarps,noTarps)[c(7,8,9,10)]
+
+all %>%
+  dplyr::select(-ClassTarp) %>%
+  ggpairs(upper=list(continuous=wrap("cor", size=3)),
+          mapping=ggplot2::aes(color=all$ClassTarp, alpha=0.7))
+```
+
+The bottom right cell of the correlation plots makes it clear that band 3 represented Blue. And after comparing the mean values of each band in the hold out data to the mean values of each color in the training data, it was evident that the bands were in RGB order.
+
+```{r}
+hold.out <- hold.out %>% dplyr::rename(Red = B1, Green = B2, Blue = B3)
+```
+
+```{r, echo=FALSE}
+# reload the needed models and stats
+data.log <- readRDS("./rds_objects/model_log.rds")
+data.lda <- readRDS("./rds_objects/model_lda.rds")
+data.qda <- readRDS("./rds_objects/model_qda.rds")
+data.knn <- readRDS("./rds_objects/model_knn.rds")
+data.plr <- readRDS("./rds_objects/model_plr.rds")
+data.rdf <- readRDS("./rds_objects/model_rdf.rds")
+data.svm <- readRDS("./rds_objects/model_svm.rds")
+
+log.selected <- readRDS("./rds_objects/stats_log.rds")
+lda.selected <- readRDS("./rds_objects/stats_lda.rds")
+qda.selected <- readRDS("./rds_objects/stats_qda.rds")
+knn.selected <- readRDS("./rds_objects/stats_knn.rds")
+plr.selected <- readRDS("./rds_objects/stats_plr.rds")
+rdf.selected <- readRDS("./rds_objects/stats_rdf.rds")
+svm.selected <- readRDS("./rds_objects/stats_svm.rds")
+```
+
+## Testing Against the Hold-out Data
+
+After getting the hold-out data in order, I was ready to test the trained models against the test set. I did this using the predictionStats() function shown in the Functions section. The function used each model to predict the hold-out data, and returned the updated measurements of accuracy, TPR, FPR, AUROC, and precision.
+
+```{r}
+log.pred <- predictionStats(data.log, log.selected)
+lda.pred <- predictionStats(data.lda, lda.selected)
+qda.pred <- predictionStats(data.qda, qda.selected)
+knn.pred <- predictionStats(data.knn, knn.selected)
+plr.pred <- predictionStats(data.plr, plr.selected)
+rdf.pred <- predictionStats(data.rdf, rdf.selected)
+svm.pred <- predictionStats(data.svm, svm.selected)
+```
+
+
+```{r, echo=FALSE}
+# just in case, again
+saveRDS(log.pred, "./rds_objects/pred_log.rds")
+saveRDS(lda.pred, "./rds_objects/pred_lda.rds")
+saveRDS(qda.pred, "./rds_objects/pred_qda.rds")
+saveRDS(knn.pred, "./rds_objects/pred_knn.rds")
+saveRDS(plr.pred, "./rds_objects/pred_plr.rds")
+saveRDS(rdf.pred, "./rds_objects/pred_rdf.rds")
+saveRDS(svm.pred, "./rds_objects/pred_svm.rds")
+```
 
 # Results (Hold-Out)
 
-**Hold-Out Performance Table Here**
+```{r, echo=FALSE}
+log.pred <- log.pred %>% mutate(Model="Log Reg")
+lda.pred <- lda.pred %>% mutate(Model="LDA")
+qda.pred <- qda.pred %>% mutate(Model="QDA")
+knn.pred <- knn.pred %>% mutate(Model="KNN")
+plr.pred <- plr.pred %>% mutate(Model="PLR")
+rdf.pred <- rdf.pred %>% mutate(Model="RF")
+svm.pred <- svm.pred %>% mutate(Model="SVM")
+
+stats.pred <- Reduce(function(x, y) merge(x, y, all=TRUE),
+                     list(log.pred,
+                          lda.pred,
+                          qda.pred,
+                          knn.pred,
+                          plr.pred,
+                          rdf.pred,
+                          svm.pred))
+
+stats.pred.table <- stats.pred %>%
+  dplyr::select("Model","Tuning", "Tuning2","AUROC",
+                "Threshold","Accuracy",
+                "TPR","FPR","Precision") %>%
+  column_to_rownames(var = 'Model') %>%
+  round(4)
+
+# reorder to match example given
+stats.pred.table <- stats.pred.table[c(7,6,5,4,1,3,2),]
+# https://cran.r-project.org/web/packages/htmlTable/vignettes/general.html
+stats.pred.table %>%
+  addHtmlTableStyle(col.rgroup = c("none", "#F8F8F8")) %>%
+  htmlTable(rowlabel="Model",
+            caption="*Tuning2 refers to lambda for PLR and sigma for SVM.")
+```
 
 # Final Conclusions
 
-### Conclusion \#1 Would adding the lat/lon coordinates have helped the accuracy?
+### The Optimal Model (Cross-Validation)
 
-### Conclusion \#2
+Of the seven models trained through cross-validation, I did not see a clear winner. That is not to say the data is not suited to any particular type of model, but it is worth noting that the data was least-suited to discriminant analysis. The QDA and LDA models had the highest FPRs and lowest precisions, AUROCs, and accuracies on the table. Their high FPRs were accompanied by the highest TPRs on the table as well, which points towards both models overclassifying blue tarp pixels.
 
-### Conclusion \#3
+If I focused solely accuracy and FNR (1-TPR), the best models from this analysis were the QDA and KNN. The QDA model had the second to lowest accuracy, but the best performance in minimizing the FNR, which I believed was a very important value to minimize in these circumstances. All of the seven model types had AUROC, accuracy, and TPR values of at least 0.99, showing that each model would be effective.
 
-### Conclusion \#4
+The KNN model, with k=20 as the tuning parameter and 0.5 as the threshold, had the second highest accuracy, highest AUROC, and second highest precision metrics. It also had the second lowest FPR, which would be very beneficial to reducing wasted time on trying to reach areas no one was actually in. It is worth noting that the KNN model’s metrics might have been even higher if I had stuck with the chosen k=10 model, instead of increasing k to 20 to allow for more stability.
 
-### Conclusion \#5
+The random forest model had similar performance in cross-validation to the KNN model. They had matching Accuracy, identical TPR and precision, and the random forest model had the lowest FPR of all seven. In addition to an outstanding FPR, the model had the second best precision.
 
-### Conclusion \#6
+In a situation where people need to be located accurately and quickly, I believe it would also be pertinent to make sure no one is left behind. So when comparing these models I placed a lot of importance on the FNR (1-TPR). From that metric alone, the best model would be QDA. However, time and resources need to be considered in these situations and the FPR of the QDA model could result in a lot of wasted resources on unnecessary searches. Too keep a good balance between FNR and FPR, I believe the best model would be because of it's very low FNR and low FPR values. Though my level of confidence in this decision is not that high because these statistics are very similar, and were generated without a test data set.
+
+### The Optimal Model (Hold-Out Test)
+
+It was clear that the performances of most models in cross-validation and hold-out test showed major differences. Judging these performances from the same lense, finding the optimal model for locating the most displaced individuals within a reasonable amount of time and use of resources would be dependent on the FNR and FPR values. From that perspective there were two clear contenders, logistic regression and penalized logistic regression.
+
+The logistic regression model had the second highest AUROC at 0.9994 and the lowest FPR at 0.0171. Such a low FPR would greatly improve the proper allocation of resources. Also, the logistic regression model had the highest precision seen in both the cross-validation and hold-out tests at 0.9999. These values were very impressive, but also quite similar to that of another model. The penalized logistic regression model had the highest AUROC at 0.9995, the second lowest FPR at 0.0226, and the second highest precision at 0.9998. 
+
+Although the metrics of these models are very similar, I believed the penalized logistic regression model to be the optimal solution. This was because the increase in FPR was still quite small (especially relative to the other models), and seemed to be a sacrifice worth the increase in TPR and decrease in FNR.
+
+### Compatible Findings
+
+Even though the optimal models found from cross-validation and hold-out testing do not match, most results of each performance measure could be seen as compatible. it is difficult to distinguish a strong difference between values when everything either begins with 0.98 or 0.99, and the values could easily be considered identical.
+
+Where the results are not compatible is in relative rankings. There were noticeable increases and decreases in ranks among values for several models. For TPR, QDA was the highest in cross validation, but fell to the lowest rank in the hold-out test. At the same time, random forest jumped from 6th to 3rd. Another noticeable change was in precision where SVM dropped from 3rd to last, and random forest from 1st to 6th. Although, with these drastic changes, some other models stayed relatively close to their starting rank for most metrics. It is because of this that I believe the results are reconcilable.
+
+The discrepancies in the model performances could be attributed to the differences between the training and test data color distributions. Hue and brightness play a strong role in color values, and it could be possible the imagery had different levels of both. The training data had dimmer blues while the hold-out data had a stronger distinction between tarp and non-tarp pixels based solely on the blue value. The training on dimmer blue values could explain the increase in false positives for most models in the hold-out test, where non-tarp pixels that resembled the dimmer tarp pixels of the training data were wrongly classified. Perhaps the training data could be normalized to decrease the effects of brightness.
+
+### Relevant Metrics
+
+Through this analysis, I believed the most important metrics to consider for all models were FNR and FPR. Balancing both of those values would lead to an optimal solution of the most people located in the fastest time. It was very important to reduce the FNR as to make sure no displaced people were being left behind. It was also important to recognize that cost of searching for and providing aid across a devasted region. Decreasing FNR without regard for FPR would not be useful because the most people would be located, but a large amount of resources could be wasted on trying to reach areas without people present. A third important metric considered was precision. Precision provided a measure of the dispersion of prediction errors. Higher precision values imply greater confidence in the TPR and FPR values seen.  
+
+### Real-World Application
+
+I think this method can be effective for classifying blue tarp pixels in imagery, but I do not believe it to be the optimal solution in a real-world application. In real-world context, there are a lot of additional factors that would need to be considered before any lives could be saved. Factors like road access and closures, location of displaced people relative to airports, and available funds/resources have a huge impact on the execution and effectiveness of relief efforts. For example, more points of access to aid would need to be set up in an area with many road closures than an area of the same size and density of people with open access to roads.
+
+I think these models can greatly benefit relief efforts and influence logistic decisions by identifying highly probable locations of displaced people, but I also recognize there is a lot more work to be done before those people can be helped.
+
+### Model Improvement
+
+On a larger scale of imagery, I believe the accuracy of the models could be improved with some geospatial influence. Predicting the location of people strictly off color leaves a lot of room to be misled. For example, a shed on a farm has a blue roof, or there is a water feature reflecting enough light.
+
+If the nature of the placement of blue tarps followed a general rule, where most displaced people congregated together, then additional tools like kernel density could be used to add extra confidence to the predictions. Adding this spatial context would allow the model to rule out the "blue tarp" pixels that were located in very sparsely populated areas that are very unlikely to be hosting displaced individuals. The results of which could be provided in the form of heatmaps instead of direct point locations, which would be more beneficial to search parties by not having a strict location rather a general area in which displaced people are possibly moving locations.
