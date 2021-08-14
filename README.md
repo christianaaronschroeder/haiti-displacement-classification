@@ -25,7 +25,24 @@ The data came in differing formats, but consisted of at least three fields defin
 
 <img src="Project-2_Schroeder_Christian_files/figure-html/unnamed-chunk-4-1.png" alt="Training Data" width="45%"> <img src="Project-2_Schroeder_Christian_files/figure-html/unnamed-chunk-54-1.png" alt="Hold-out Data" width="45%">
 
-The RGB values are what were used as the predictors in the models. Additional fields were either available or created to assist analysis. The Class field defined land-classification of the pixel, whether that be vegetation, soil, rooftop, various non-tarp, or blue tarp. To make the analysis easier, a new binary field was added to the dataset representing whether or not the pixel was a "Blue Tarp." This was done to simplify the modeling process, because I was not interested in predicting the other classes. The new field, "ClassTarp," was used as the response in the models.
+The RGB values are what were used as the predictors in the models. Additional fields were either available or created to assist analysis. The Class field defined land-classification of the pixel, whether that be vegetation, soil, rooftop, various non-tarp, or blue tarp. To make the analysis easier, a new binary field was added to the dataset representing whether or not the pixel was a "Blue Tarp." This was done to simplify the modeling process, because I was not interested in predicting the other classes. The new field, "ClassTarp," was used as the response in the models
+
+# The Models
+
+The following models were trained and used to predict the locations of blue tarps:
+- Logistic Regression
+- Linear Discriminant Analysis (LDA)
+- Quadratic Discriminant Analysis (QDA)
+- K-Nearest Neighbor (KNN)
+- Penalized Logistic Regression (ElasticNet)
+- Random Forest
+- Support Vector Machines (SVM)
+
+# ...
+
+In-depth details of the analysis can be found in the full report: https://rpubs.com/christianaaronschroeder/799196
+
+# ...
 
 # Final Conclusions
 
